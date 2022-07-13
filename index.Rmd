@@ -1,0 +1,304 @@
+---
+title: OBIS species richness for OSPAR
+date: "`r Sys.Date()`"
+author: Pieter Provoost
+output: (function(...) {
+  rmdformats::robobook(toc_depth = 4, pandoc_args = c("+RTS", "-K2000m", "-RTS"), ...) })
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "docs") })  
+---
+
+## Loading occurrences from parquet and indexing to H3
+
+The biodiversity indicators will be calculated for hexagonal grid cells. Load occurrences from the full parquet export on S3, and index on the H3 hexagonal grids of resolution 3 and 4. 
+```{r message=FALSE, warning=FALSE}
+library(tibble)
+library(arrow)
+library(dplyr)
+library(sf)
+library(glue)
+library(h3)
+
+space <- S3FileSystem$create(
+  anonymous = TRUE,
+  scheme = "https",
+  endpoint_override = "ams3.digitaloceanspaces.com"
+)
+
+df <- open_dataset(space$path("obis-datasets/exports/obis_20220710.parquet")) %>%
+  select(decimalLongitude, decimalLatitude, minimumDepthInMeters, maximumDepthInMeters, species) %>%
+  filter(!is.na(species)) %>%
+  map_batches(function(batch) {
+    batch %>%
+      as.data.frame() %>%
+      mutate_at(vars(minimumDepthInMeters, maximumDepthInMeters), as.numeric) %>%
+      rowwise() %>%
+      mutate(depth = mean(na.omit(c(minimumDepthInMeters, maximumDepthInMeters)))) %>%
+      select(-minimumDepthInMeters, -maximumDepthInMeters) %>%
+      group_by(decimalLongitude, decimalLatitude, depth, species) %>%
+      summarize(records = n()) %>%
+      ungroup() %>%
+      st_as_sf(coords = c("decimalLongitude", "decimalLatitude")) %>%
+      mutate(cell3 = geo_to_h3(., res = 3)) %>%
+      mutate(cell4 = geo_to_h3(., res = 4)) %>%
+      mutate(p3 = substr(cell3, 5, 6)) %>%
+      mutate(p4 = substr(cell4, 5, 6)) %>%
+      st_drop_geometry()
+  })
+
+partitions3 <- unique(df$p3)
+partitions4 <- unique(df$p4)
+```
+
+### Write to disk
+
+Write the datasets to disk as partitioned parquet files and clean up the data frame:
+
+```{r message=FALSE, warning=FALSE}
+temp_dir <- tempdir()
+dir3 <- file.path(temp_dir, "cell3")
+dir4 <- file.path(temp_dir, "cell4")
+unlink(dir3, recursive = TRUE)
+unlink(dir4, recursive = TRUE)
+
+df %>% select(-cell4, -p4) %>% write_dataset(path = dir3, partitioning = "p3", format = "parquet")
+df %>% select(-cell3, -p3) %>% write_dataset(path = dir4, partitioning = "p4", format = "parquet")
+
+remove(df)
+gc()
+```
+
+## Calculating indicators
+
+The following method calculates the number of records, species richness, Simpson index, Shannon index, Hurlbert index, and Hill numbers for each cell:
+
+```{r message=FALSE, warning=FALSE}
+library(gsl)
+
+calc <- function(df, cell_col = "cell", esn = 50) {
+  df <- df %>% rename(cell = !!sym(cell_col))
+  t1 <- df %>%
+    group_by(cell, species) %>%
+    summarize(ni = sum(records))
+  t2 <- t1 %>%
+    group_by(cell) %>%
+    mutate(n = sum(ni))
+  t3 <- t2 %>%
+    group_by(cell, species) %>%
+    mutate(
+      hi = -(ni/n*log(ni/n)), si = (ni/n)^2, qi = ni/n,
+      esi = case_when(
+        n-ni >= esn ~ 1-exp(lngamma(n-ni+1)+lngamma(n-esn+1)-lngamma(n-ni-esn+1)-lngamma(n+1)),
+        n >= esn ~ 1
+      )
+    )
+  t4 <- t3 %>%
+    group_by(cell) %>%
+    summarize(n = sum(ni), sp = n(), shannon = sum(hi), simpson = sum(si), maxp = max(qi), es = sum(esi))
+  result <- t4 %>%
+    mutate(hill_1 = exp(shannon), hill_2 = 1/simpson, hill_inf = 1/maxp)
+  return(result)
+}
+```
+
+Then read each partition, perform the calculations, and transform to a spatial grid:
+
+```{r message=FALSE, warning=FALSE}
+results3 <- purrr::map(partitions3, function(partition_id) {
+  ss <- open_dataset(dir3) %>%
+    filter(p3 == partition_id) %>%
+    collect()
+  res <- calc(ss, cell_col = "cell3")
+  gc()
+  res
+}) %>%
+  bind_rows() %>%
+  mutate(h3_to_geo_boundary_sf(cell)) %>%
+  st_as_sf() %>%
+  st_wrap_dateline()
+
+results4 <- purrr::map(partitions4, function(partition_id) {
+  ss <- open_dataset(dir4) %>%
+    filter(p4 == partition_id) %>%
+    collect()
+  res <- calc(ss, cell_col = "cell4")
+  gc()
+  res
+}) %>%
+  bind_rows() %>%
+  mutate(h3_to_geo_boundary_sf(cell)) %>%
+  st_as_sf() %>%
+  st_wrap_dateline()
+```
+
+Use the same procedure to calculate results for shallow and deep occurrences only:
+
+```{r message=FALSE, warning=FALSE}
+results3_shallow <- purrr::map(partitions3, function(partition_id) {
+  ss <- open_dataset(dir3) %>%
+    filter(p3 == partition_id & depth < 100) %>%
+    collect()
+  res <- calc(ss, cell_col = "cell3")
+  gc()
+  res
+}) %>%
+  bind_rows() %>%
+  mutate(h3_to_geo_boundary_sf(cell)) %>%
+  st_as_sf() %>%
+  st_wrap_dateline()
+
+results3_deep <- purrr::map(partitions3, function(partition_id) {
+  ss <- open_dataset(dir3) %>%
+    filter(p3 == partition_id & depth >= 100) %>%
+    collect()
+  res <- calc(ss, cell_col = "cell3")
+  gc()
+  res
+}) %>%
+  bind_rows() %>%
+  mutate(h3_to_geo_boundary_sf(cell)) %>%
+  st_as_sf() %>%
+  st_wrap_dateline()
+```
+
+## Maps
+
+```{r message=FALSE, warning=FALSE}
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(viridis)
+library(ggplot2)
+library(orthoview)
+library(scales) 
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+boundary_atlantic <- st_bbox(c(xmin = -45, xmax = 55, ymin = 10, ymax = 90)) %>%
+  st_as_sfc() %>%
+  st_segmentize(1) %>%
+  st_set_crs(4326)
+boundary_naces <- read_sf("NACES_MPA_Shp/NACES_MPA.shp")
+
+lon <- -10
+lat <- 40
+
+ortho3 <- results3 %>% orthoview(lon, lat)
+ortho4 <- results4 %>% orthoview(lon, lat)
+ortho3_shallow <- results3_shallow %>% orthoview(lon, lat)
+ortho3_deep <- results3_deep %>% orthoview(lon, lat)
+world_ortho <- world %>% orthoview(lon, lat)
+
+make_plot <- function(df, variable, name, boundary, trans = "identity", ...) {
+  ggplot() +
+    geom_sf(data = df, aes_string(fill = variable), lwd = 0) +
+    scale_fill_viridis(option = "inferno", na.value = "white", trans = trans, labels = comma, name = name) +
+    geom_sf(data = world_ortho, fill = "#ffffff", color = "#000000", size = 0.1) +
+    geom_sf(data = boundary, color = "#ff4000", fill = NA, size = 1.3) +
+    theme_minimal() +
+    guides(fill = guide_colourbar(barwidth = 10)) +
+    theme(panel.grid.major = element_blank(), legend.position = "bottom") +
+    coord_sf(crs = create_ortho_string(lon, lat), ...)
+}
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3, "n", "Records", boundary_atlantic, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3, "sp", "Species richness", boundary_atlantic, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho4, "n", "Records", boundary_naces, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho4, "sp", "Species richness", boundary_naces, "log10")
+```
+
+Zoomed in:
+
+```{r message=FALSE, warning=FALSE}
+bb <- boundary_naces %>% st_buffer(10) %>% st_transform(create_ortho_string(lon, lat)) %>% st_bbox()
+make_plot(ortho3, "sp", "Species richness", boundary_naces, "log10", xlim = c(bb$xmin, bb$xmax), ylim = c(bb$ymin, bb$ymax))
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho4, "sp", "Species richness", boundary_naces, "log10", xlim = c(bb$xmin, bb$xmax), ylim = c(bb$ymin, bb$ymax))
+```
+
+### Shallow occurrences
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3_shallow, "n", "Records", boundary_atlantic, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3_shallow, "sp", "Species richness", boundary_atlantic, "log10")
+```
+
+### Deep occurrences
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3_deep, "n", "Records", boundary_atlantic, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3_deep, "sp", "Species richness", boundary_atlantic, "log10")
+```
+
+## Species lists
+
+```{r message=FALSE, warning=FALSE}
+create_species_list <- function(boundary, filename, min_depth = NULL, max_depth = NULL) {
+  cells <- polyfill(boundary, res = 4)
+  df <- open_dataset(dir4) %>%
+    filter(cell4 %in% cells)
+  if (!is.null(min_depth)) {
+    df <- df %>% filter(depth >= min_depth)
+  }
+  if (!is.null(max_depth)) {
+    df <- df %>% filter(depth < max_depth)
+  }
+  species <- df %>% distinct(species) %>% collect()
+  write.table(species, filename, row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+```
+
+All species North Atlantic:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_atlantic, "output/species_atlantic.txt")
+```
+
+All species NACES MPA:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_naces, "output/species_naces.txt")
+```
+
+Shallow species North Atlantic:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_atlantic, "output/species_atlantic_shallow.txt", max_depth = 100)
+```
+
+Shallow species NACES MPA:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_naces, "output/species_naces_shallow.txt", max_depth = 100)
+```
+
+Deep species North Atlantic:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_atlantic, "output/species_atlantic_deep.txt", min_depth = 100)
+```
+
+Deep species NACES MPA:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_naces, "output/species_naces_deep.txt", min_depth = 100)
+```
