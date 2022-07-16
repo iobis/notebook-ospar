@@ -179,6 +179,7 @@ boundary_atlantic <- st_bbox(c(xmin = -45, xmax = 55, ymin = 10, ymax = 90)) %>%
   st_segmentize(1) %>%
   st_set_crs(4326)
 boundary_naces <- read_sf("NACES_MPA_Shp/NACES_MPA.shp")
+boundary_ospar <- read_sf("OSPAR_Subregions/OSPAR_subregions_20160418_3857.shp") %>% st_buffer(1000) %>% st_union() %>% st_transform(4326)
 
 lon <- -10
 lat <- 40
@@ -211,6 +212,14 @@ make_plot(ortho3, "sp", "Species richness", boundary_atlantic, "log10")
 ```
 
 ```{r message=FALSE, warning=FALSE}
+make_plot(ortho3, "n", "Records", boundary_ospar, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
+make_plot(ortho3, "sp", "Species richness", boundary_ospar, "log10")
+```
+
+```{r message=FALSE, warning=FALSE}
 make_plot(ortho4, "n", "Records", boundary_naces, "log10")
 ```
 
@@ -218,7 +227,7 @@ make_plot(ortho4, "n", "Records", boundary_naces, "log10")
 make_plot(ortho4, "sp", "Species richness", boundary_naces, "log10")
 ```
 
-Zoomed in:
+NACES MPA in detail:
 
 ```{r message=FALSE, warning=FALSE}
 bb <- boundary_naces %>% st_buffer(10) %>% st_transform(create_ortho_string(lon, lat)) %>% st_bbox()
@@ -232,21 +241,21 @@ make_plot(ortho4, "sp", "Species richness", boundary_naces, "log10", xlim = c(bb
 ### Shallow occurrences
 
 ```{r message=FALSE, warning=FALSE}
-make_plot(ortho3_shallow, "n", "Records", boundary_atlantic, "log10")
+make_plot(ortho3_shallow, "n", "Records", boundary_ospar, "log10")
 ```
 
 ```{r message=FALSE, warning=FALSE}
-make_plot(ortho3_shallow, "sp", "Species richness", boundary_atlantic, "log10")
+make_plot(ortho3_shallow, "sp", "Species richness", boundary_ospar, "log10")
 ```
 
 ### Deep occurrences
 
 ```{r message=FALSE, warning=FALSE}
-make_plot(ortho3_deep, "n", "Records", boundary_atlantic, "log10")
+make_plot(ortho3_deep, "n", "Records", boundary_ospar, "log10")
 ```
 
 ```{r message=FALSE, warning=FALSE}
-make_plot(ortho3_deep, "sp", "Species richness", boundary_atlantic, "log10")
+make_plot(ortho3_deep, "sp", "Species richness", boundary_ospar, "log10")
 ```
 
 ## Species lists
@@ -273,6 +282,12 @@ All species North Atlantic:
 create_species_list(boundary_atlantic, "output/species_atlantic.txt")
 ```
 
+All species OSPAR:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_ospar, "output/species_ospar.txt")
+```
+
 All species NACES MPA:
 
 ```{r message=FALSE, warning=FALSE}
@@ -285,6 +300,12 @@ Shallow species North Atlantic:
 create_species_list(boundary_atlantic, "output/species_atlantic_shallow.txt", max_depth = 100)
 ```
 
+Shallow species OSPAR:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_ospar, "output/species_ospar_shallow.txt", max_depth = 100)
+```
+
 Shallow species NACES MPA:
 
 ```{r message=FALSE, warning=FALSE}
@@ -295,6 +316,12 @@ Deep species North Atlantic:
 
 ```{r message=FALSE, warning=FALSE}
 create_species_list(boundary_atlantic, "output/species_atlantic_deep.txt", min_depth = 100)
+```
+
+Deep species OSPAR:
+
+```{r message=FALSE, warning=FALSE}
+create_species_list(boundary_ospar, "output/species_ospar_deep.txt", min_depth = 100)
 ```
 
 Deep species NACES MPA:
